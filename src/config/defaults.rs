@@ -92,6 +92,26 @@ pub(crate) fn default_metrics_whitelist() -> Vec<IpNetwork> {
     ]
 }
 
+pub(crate) fn default_api_listen() -> String {
+    "127.0.0.1:9091".to_string()
+}
+
+pub(crate) fn default_api_whitelist() -> Vec<IpNetwork> {
+    default_metrics_whitelist()
+}
+
+pub(crate) fn default_api_request_body_limit_bytes() -> usize {
+    64 * 1024
+}
+
+pub(crate) fn default_api_minimal_runtime_enabled() -> bool {
+    false
+}
+
+pub(crate) fn default_api_minimal_runtime_cache_ttl_ms() -> u64 {
+    1000
+}
+
 pub(crate) fn default_prefer_4() -> u8 {
     4
 }
