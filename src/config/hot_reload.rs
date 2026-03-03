@@ -115,6 +115,15 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
             old.server.port, new.server.port
         );
     }
+    if old.server.api.enabled != new.server.api.enabled
+        || old.server.api.listen != new.server.api.listen
+        || old.server.api.whitelist != new.server.api.whitelist
+        || old.server.api.auth_header != new.server.api.auth_header
+        || old.server.api.request_body_limit_bytes != new.server.api.request_body_limit_bytes
+        || old.server.api.read_only != new.server.api.read_only
+    {
+        warn!("config reload: server.api changed; restart required");
+    }
     if old.censorship.tls_domain != new.censorship.tls_domain {
         warn!(
             "config reload: censorship.tls_domain changed ('{}' → '{}'); restart required",

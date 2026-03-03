@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use rand::Rng;
@@ -398,6 +398,18 @@ impl ProxyConfig {
             ));
         }
 
+        if config.server.api.request_body_limit_bytes == 0 {
+            return Err(ProxyError::Config(
+                "server.api.request_body_limit_bytes must be > 0".to_string(),
+            ));
+        }
+
+        if config.server.api.listen.parse::<SocketAddr>().is_err() {
+            return Err(ProxyError::Config(
+                "server.api.listen must be in IP:PORT format".to_string(),
+            ));
+        }
+
         if config.general.effective_me_pool_force_close_secs() > 0
             && config.general.effective_me_pool_force_close_secs()
                 < config.general.me_pool_drain_ttl_secs
@@ -695,6 +707,12 @@ mod tests {
         assert_eq!(cfg.general.update_every, default_update_every());
         assert_eq!(cfg.server.listen_addr_ipv4, default_listen_addr_ipv4());
         assert_eq!(cfg.server.listen_addr_ipv6, default_listen_addr_ipv6_opt());
+        assert_eq!(cfg.server.api.listen, default_api_listen());
+        assert_eq!(cfg.server.api.whitelist, default_api_whitelist());
+        assert_eq!(
+            cfg.server.api.request_body_limit_bytes,
+            default_api_request_body_limit_bytes()
+        );
         assert_eq!(cfg.access.users, default_access_users());
     }
 
@@ -776,6 +794,12 @@ mod tests {
 
         let server = ServerConfig::default();
         assert_eq!(server.listen_addr_ipv6, Some(default_listen_addr_ipv6()));
+        assert_eq!(server.api.listen, default_api_listen());
+        assert_eq!(server.api.whitelist, default_api_whitelist());
+        assert_eq!(
+            server.api.request_body_limit_bytes,
+            default_api_request_body_limit_bytes()
+        );
 
         let access = AccessConfig::default();
         assert_eq!(access.users, default_access_users());
