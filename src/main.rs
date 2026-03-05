@@ -1051,6 +1051,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
     info!("============================================================");
 
+    if let Some(ref pool) = me_pool {
+        pool.set_runtime_ready(true);
+    }
+
     // Background tasks
     let um_clone = upstream_manager.clone();
     let decision_clone = decision.clone();

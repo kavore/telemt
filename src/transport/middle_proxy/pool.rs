@@ -149,6 +149,7 @@ pub struct MePool {
     pub(super) me_route_no_writer_wait: Duration,
     pub(super) me_route_inline_recovery_attempts: u32,
     pub(super) me_route_inline_recovery_wait: Duration,
+    pub(super) runtime_ready: AtomicBool,
     pool_size: usize,
 }
 
@@ -355,11 +356,20 @@ impl MePool {
             me_route_no_writer_wait: Duration::from_millis(me_route_no_writer_wait_ms),
             me_route_inline_recovery_attempts,
             me_route_inline_recovery_wait: Duration::from_millis(me_route_inline_recovery_wait_ms),
+            runtime_ready: AtomicBool::new(false),
         })
     }
 
     pub fn current_generation(&self) -> u64 {
         self.active_generation.load(Ordering::Relaxed)
+    }
+
+    pub fn set_runtime_ready(&self, ready: bool) {
+        self.runtime_ready.store(ready, Ordering::Relaxed);
+    }
+
+    pub fn is_runtime_ready(&self) -> bool {
+        self.runtime_ready.load(Ordering::Relaxed)
     }
 
     pub fn update_runtime_reinit_policy(
