@@ -20,7 +20,7 @@ mod runtime_tasks;
 mod shutdown;
 mod tls_bootstrap;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore, watch};
@@ -189,6 +189,7 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let (api_config_tx, api_config_rx) = watch::channel(Arc::new(config.clone()));
+    let (detected_ips_tx, detected_ips_rx) = watch::channel((None::<IpAddr>, None::<IpAddr>));
     let initial_admission_open = !config.general.use_middle_proxy;
     let (admission_tx, admission_rx) = watch::channel(initial_admission_open);
     let initial_route_mode = if config.general.use_middle_proxy {
@@ -223,6 +224,7 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let admission_rx_api = admission_rx.clone();
             let config_path_api = std::path::PathBuf::from(&config_path);
             let startup_tracker_api = startup_tracker.clone();
+            let detected_ips_rx_api = detected_ips_rx.clone();
             tokio::spawn(async move {
                 api::serve(
                     listen,
@@ -233,8 +235,7 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     config_rx_api,
                     admission_rx_api,
                     config_path_api,
-                    None,
-                    None,
+                    detected_ips_rx_api,
                     process_started_at_epoch_secs,
                     startup_tracker_api,
                 )
@@ -288,6 +289,10 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.general.stun_nat_probe_concurrency,
     )
     .await?;
+    detected_ips_tx.send_replace((
+        probe.detected_ipv4.map(IpAddr::V4),
+        probe.detected_ipv6.map(IpAddr::V6),
+    ));
     let decision = decide_network_capabilities(&config.network, &probe);
     log_probe_result(&probe, &decision);
     startup_tracker

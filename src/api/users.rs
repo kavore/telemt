@@ -90,13 +90,14 @@ pub(super) async fn create_user(
     if let Some(limit) = updated_limit {
         shared.ip_tracker.set_user_limit(&body.username, limit).await;
     }
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
 
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user = users
@@ -118,8 +119,8 @@ pub(super) async fn create_user(
             links: build_user_links(
                 &cfg,
                 &secret,
-                shared.startup_detected_ip_v4,
-                shared.startup_detected_ip_v6,
+                detected_ip_v4,
+                detected_ip_v6,
             ),
         });
 
@@ -185,12 +186,13 @@ pub(super) async fn patch_user(
     if let Some(limit) = updated_limit {
         shared.ip_tracker.set_user_limit(user, limit).await;
     }
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user_info = users
@@ -232,12 +234,13 @@ pub(super) async fn rotate_secret(
     let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
     drop(_guard);
 
+    let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
     let users = users_from_config(
         &cfg,
         &shared.stats,
         &shared.ip_tracker,
-        shared.startup_detected_ip_v4,
-        shared.startup_detected_ip_v6,
+        detected_ip_v4,
+        detected_ip_v6,
     )
     .await;
     let user_info = users
@@ -418,17 +421,6 @@ fn resolve_link_hosts(
         return vec![host.to_string()];
     }
 
-    let mut startup_hosts = Vec::new();
-    if let Some(ip) = startup_detected_ip_v4 {
-        push_unique_host(&mut startup_hosts, &ip.to_string());
-    }
-    if let Some(ip) = startup_detected_ip_v6 {
-        push_unique_host(&mut startup_hosts, &ip.to_string());
-    }
-    if !startup_hosts.is_empty() {
-        return startup_hosts;
-    }
-
     let mut hosts = Vec::new();
     for listener in &cfg.server.listeners {
         if let Some(host) = listener
@@ -443,24 +435,44 @@ fn resolve_link_hosts(
         if let Some(ip) = listener.announce_ip {
             if !ip.is_unspecified() {
                 push_unique_host(&mut hosts, &ip.to_string());
+                continue;
+            }
+        }
+        if listener.ip.is_unspecified() {
+            let detected_ip = if listener.ip.is_ipv4() {
+                startup_detected_ip_v4
+            } else {
+                startup_detected_ip_v6
+            };
+            if let Some(ip) = detected_ip {
+                push_unique_host(&mut hosts, &ip.to_string());
+            } else {
+                push_unique_host(&mut hosts, &listener.ip.to_string());
             }
             continue;
         }
-        if !listener.ip.is_unspecified() {
-            push_unique_host(&mut hosts, &listener.ip.to_string());
-        }
+        push_unique_host(&mut hosts, &listener.ip.to_string());
     }
 
-    if hosts.is_empty() {
-        if let Some(host) = cfg.server.listen_addr_ipv4.as_deref() {
-            push_host_from_legacy_listen(&mut hosts, host);
-        }
-        if let Some(host) = cfg.server.listen_addr_ipv6.as_deref() {
-            push_host_from_legacy_listen(&mut hosts, host);
-        }
+    if !hosts.is_empty() {
+        return hosts;
     }
 
-    hosts
+    if let Some(ip) = startup_detected_ip_v4.or(startup_detected_ip_v6) {
+        return vec![ip.to_string()];
+    }
+
+    if let Some(host) = cfg.server.listen_addr_ipv4.as_deref() {
+        push_host_from_legacy_listen(&mut hosts, host);
+    }
+    if let Some(host) = cfg.server.listen_addr_ipv6.as_deref() {
+        push_host_from_legacy_listen(&mut hosts, host);
+    }
+    if !hosts.is_empty() {
+        return hosts;
+    }
+
+    vec!["UNKNOWN".to_string()]
 }
 
 fn push_host_from_legacy_listen(hosts: &mut Vec<String>, raw: &str) {

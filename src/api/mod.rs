@@ -75,8 +75,7 @@ pub(super) struct ApiShared {
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
-    pub(super) startup_detected_ip_v4: Option<IpAddr>,
-    pub(super) startup_detected_ip_v6: Option<IpAddr>,
+    pub(super) detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     pub(super) mutation_lock: Arc<Mutex<()>>,
     pub(super) minimal_cache: Arc<Mutex<Option<MinimalCacheEntry>>>,
     pub(super) runtime_edge_connections_cache: Arc<Mutex<Option<EdgeConnectionsCacheEntry>>>,
@@ -91,6 +90,10 @@ impl ApiShared {
     fn next_request_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn detected_link_ips(&self) -> (Option<IpAddr>, Option<IpAddr>) {
+        *self.detected_ips_rx.borrow()
+    }
 }
 
 pub async fn serve(
@@ -102,8 +105,7 @@ pub async fn serve(
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     admission_rx: watch::Receiver<bool>,
     config_path: PathBuf,
-    startup_detected_ip_v4: Option<IpAddr>,
-    startup_detected_ip_v6: Option<IpAddr>,
+    detected_ips_rx: watch::Receiver<(Option<IpAddr>, Option<IpAddr>)>,
     process_started_at_epoch_secs: u64,
     startup_tracker: Arc<StartupTracker>,
 ) {
@@ -134,8 +136,7 @@ pub async fn serve(
         me_pool,
         upstream_manager,
         config_path,
-        startup_detected_ip_v4,
-        startup_detected_ip_v6,
+        detected_ips_rx,
         mutation_lock: Arc::new(Mutex::new(())),
         minimal_cache: Arc::new(Mutex::new(None)),
         runtime_edge_connections_cache: Arc::new(Mutex::new(None)),
@@ -356,12 +357,13 @@ async fn handle(
             }
             ("GET", "/v1/stats/users") | ("GET", "/v1/users") => {
                 let revision = current_revision(&shared.config_path).await?;
+                let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
                 let users = users_from_config(
                     &cfg,
                     &shared.stats,
                     &shared.ip_tracker,
-                    shared.startup_detected_ip_v4,
-                    shared.startup_detected_ip_v6,
+                    detected_ip_v4,
+                    detected_ip_v6,
                 )
                 .await;
                 Ok(success_response(StatusCode::OK, users, revision))
@@ -399,12 +401,13 @@ async fn handle(
                 {
                     if method == Method::GET {
                         let revision = current_revision(&shared.config_path).await?;
+                        let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
                         let users = users_from_config(
                             &cfg,
                             &shared.stats,
                             &shared.ip_tracker,
-                            shared.startup_detected_ip_v4,
-                            shared.startup_detected_ip_v6,
+                            detected_ip_v4,
+                            detected_ip_v6,
                         )
                         .await;
                         if let Some(user_info) = users.into_iter().find(|entry| entry.username == user)
