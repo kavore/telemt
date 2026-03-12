@@ -19,22 +19,9 @@
 
 ### 🇷🇺 RU
 
-#### Релиз 3.3.5 LTS - 6 марта
+#### Релиз 3.3.16
 
-6 марта мы выпустили Telemt **3.3.5**
-
-Это [3.3.5 - первая LTS-версия telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)!
-
-В ней используется:
-- новый алгоритм ME NoWait для непревзойдённо быстрого восстановления пула
-- Adaptive Floor, поддерживающий количество ME Writer на оптимальном уровне
-- модель усовершенствованного доступа к KDF Fingerprint на RwLock
-- строгая привязка Middle-End к DC-ID с предсказуемым алгоритмом деградации и самовосстановления
-
-Telemt Control API V1 в 3.3.5 включает:
-- несколько режимов работы в зависимости от доступных ресурсов
-- снапшот-модель для живых метрик без вмешательства в hot-path
-- минималистичный набор запросов для управления пользователями
+[3.3.16](https://github.com/telemt/telemt/releases/tag/3.3.16)!
 
 Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **API**, **статистики**, **UX**
 
@@ -53,22 +40,9 @@ Telemt Control API V1 в 3.3.5 включает:
 
 ### 🇬🇧 EN
 
-#### Release 3.3.5 LTS - March 6
+#### Release 3.3.16
 
-On March 6, we released Telemt **3.3.3**
-
-This is [3.3.5 - the first LTS release of telemt](https://github.com/telemt/telemt/releases/tag/3.3.5)
-
-It introduces:
-- the new ME NoWait algorithm for exceptionally fast pool recovery
-- Adaptive Floor, which maintains the number of ME Writers at an optimal level
-- an improved KDF Fingerprint access model based on RwLock
-- strict binding of Middle-End instances to DC-ID with a predictable degradation and self-recovery algorithm
-
-Telemt Control API V1 in version 3.3.5 includes:
-- multiple operating modes depending on available resources
-- a snapshot-based model for live metrics without interfering with the hot path
-- a minimalistic request set for user management
+[3.3.16](https://github.com/telemt/telemt/releases/tag/3.3.16)
 
 We are looking forward to your feedback and improvement proposals — especially regarding **API**, **statistics**, **UX**
 
