@@ -6,6 +6,8 @@ mod config;
 mod crypto;
 mod error;
 mod ip_tracker;
+#[cfg(test)]
+mod ip_tracker_regression_tests;
 mod maestro;
 mod metrics;
 mod network;

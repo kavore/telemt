@@ -21,6 +21,12 @@ mod secret;
 mod selftest;
 mod wire;
 mod pool_status;
+#[cfg(test)]
+mod health_regression_tests;
+#[cfg(test)]
+mod health_integration_tests;
+#[cfg(test)]
+mod health_adversarial_tests;
 
 use bytes::Bytes;
 
