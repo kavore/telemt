@@ -40,11 +40,12 @@ pub(crate) async fn reader_loop(
 ) -> Result<()> {
     let mut raw = enc_leftover;
     let mut expected_seq: i32 = 0;
+    // 64 KB read buffer reduces syscall rate under high throughput.
+    let mut tmp = vec![0u8; 65_536];
 
     loop {
-        let mut tmp = [0u8; 16_384];
         let n = tokio::select! {
-            res = rd.read(&mut tmp) => res.map_err(ProxyError::Io)?,
+            res = rd.read(&mut tmp[..]) => res.map_err(ProxyError::Io)?,
             _ = cancel.cancelled() => return Ok(()),
         };
         if n == 0 {
