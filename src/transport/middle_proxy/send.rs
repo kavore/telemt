@@ -23,6 +23,9 @@ use super::registry::ConnMeta;
 
 const IDLE_WRITER_PENALTY_MID_SECS: u64 = 45;
 const IDLE_WRITER_PENALTY_HIGH_SECS: u64 = 55;
+/// Timeout for blocking send when writer channel is full.
+/// Prevents client main loop from freezing if a writer task is stuck or slow.
+const BLOCKING_SEND_TIMEOUT: Duration = Duration::from_millis(200);
 const HYBRID_GLOBAL_BURST_PERIOD_ROUNDS: u32 = 4;
 const PICK_PENALTY_WARM: u64 = 200;
 const PICK_PENALTY_DRAINING: u64 = 600;
@@ -34,7 +37,6 @@ const PICK_PENALTY_DEGRADED: u64 = 250;
 pub struct CachedMeWriter {
     pub writer_id: u64,
     pub tx: tokio::sync::mpsc::Sender<WriterCommand>,
-    pub source_ip: std::net::IpAddr,
     /// Pre-computed RPC header template (addresses, conn_id, ad_tag — all session-constant).
     header: RpcHeaderTemplate,
     /// Reusable buffer for payload assembly — avoids per-frame allocation.
@@ -61,12 +63,20 @@ impl MePool {
             match cache.tx.try_send(WriterCommand::Data(payload)) {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(cmd)) => {
-                    if cache.tx.send(cmd).await.is_ok() {
-                        return Ok(());
+                    match tokio::time::timeout(BLOCKING_SEND_TIMEOUT, cache.tx.send(cmd)).await {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(_)) => {
+                            let dead_id = cache.writer_id;
+                            *cached = None;
+                            self.remove_writer_and_close_clients(dead_id).await;
+                        }
+                        Err(_timeout) => {
+                            // Channel stayed full for BLOCKING_SEND_TIMEOUT — writer is likely stuck.
+                            // Invalidate cache and fall through to slow path (picks a new writer).
+                            warn!(writer_id = cache.writer_id, "ME cached writer send timeout, rebinding");
+                            *cached = None;
+                        }
                     }
-                    let dead_id = cache.writer_id;
-                    *cached = None;
-                    self.remove_writer_and_close_clients(dead_id).await;
                 }
                 Err(TrySendError::Closed(_)) => {
                     let dead_id = cache.writer_id;
@@ -100,7 +110,6 @@ impl MePool {
                 *cached = Some(CachedMeWriter {
                     writer_id: cw.writer_id,
                     tx: cw.tx,
-                    source_ip: ip,
                     header,
                     payload_buf: Vec::with_capacity(4096),
                 });
@@ -124,46 +133,54 @@ impl MePool {
         cached: &mut Option<CachedMeWriter>,
     ) {
         let (routed_dc, _) = self.resolve_target_dc_for_routing(target_dc as i32).await;
-        let writers_snapshot = {
+        // Select a writer under read lock without cloning the entire Vec.
+        let picked = {
             let ws = self.writers.read().await;
             if ws.is_empty() {
                 return;
             }
-            ws.clone()
+            let preferred = self.preferred_endpoints_for_dc(routed_dc).await;
+            if preferred.is_empty() {
+                return;
+            }
+            // Scan for candidates in-place under the read lock.
+            let mut candidates = Vec::new();
+            for (idx, w) in ws.iter().enumerate() {
+                if w.writer_dc == routed_dc
+                    && preferred.iter().any(|e| *e == w.addr)
+                    && self.writer_eligible_for_selection(w, true)
+                {
+                    candidates.push(idx);
+                }
+            }
+            if candidates.is_empty() {
+                return;
+            }
+            let start = self.rr.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+            let idx = candidates[start];
+            let w = &ws[idx];
+            if !self.writer_accepts_new_binding(w) {
+                return;
+            }
+            // Extract only what we need — avoids cloning the full MeWriter struct.
+            (w.id, w.tx.clone(), w.source_ip)
         };
-        let mut candidate_indices = self
-            .candidate_indices_for_dc(&writers_snapshot, routed_dc, false)
-            .await;
-        if candidate_indices.is_empty() {
-            candidate_indices = self
-                .candidate_indices_for_dc(&writers_snapshot, routed_dc, true)
-                .await;
-        }
-        if candidate_indices.is_empty() {
-            return;
-        }
-        let start = self.rr.fetch_add(1, Ordering::Relaxed) as usize % candidate_indices.len();
-        let idx = candidate_indices[start % candidate_indices.len()];
-        let w = &writers_snapshot[idx];
-        if !self.writer_accepts_new_binding(w) {
-            return;
-        }
-        let effective_our_addr = SocketAddr::new(w.source_ip, our_addr.port());
+        let (writer_id, tx, source_ip) = picked;
+        let effective_our_addr = SocketAddr::new(source_ip, our_addr.port());
         let meta = ConnMeta {
             target_dc,
             client_addr,
             our_addr: effective_our_addr,
             proto_flags,
         };
-        if !self.registry.bind_writer(conn_id, w.id, meta).await {
+        if !self.registry.bind_writer(conn_id, writer_id, meta).await {
             return;
         }
         let tag = tag_override.or(self.proxy_tag.as_deref());
         let header = RpcHeaderTemplate::new(conn_id, client_addr, effective_our_addr, tag, proto_flags);
         *cached = Some(CachedMeWriter {
-            writer_id: w.id,
-            tx: w.tx.clone(),
-            source_ip: w.source_ip,
+            writer_id,
+            tx,
             header,
             payload_buf: Vec::with_capacity(4096),
         });
@@ -219,12 +236,19 @@ impl MePool {
                 match current.tx.try_send(WriterCommand::Data(current_payload.clone())) {
                     Ok(()) => return Ok(()),
                     Err(TrySendError::Full(cmd)) => {
-                        if current.tx.send(cmd).await.is_ok() {
-                            return Ok(());
+                        match tokio::time::timeout(BLOCKING_SEND_TIMEOUT, current.tx.send(cmd)).await {
+                            Ok(Ok(())) => return Ok(()),
+                            Ok(Err(_)) => {
+                                warn!(writer_id = current.writer_id, "ME writer channel closed");
+                                self.remove_writer_and_close_clients(current.writer_id).await;
+                                continue;
+                            }
+                            Err(_timeout) => {
+                                warn!(writer_id = current.writer_id, "ME bound writer send timeout, rebinding");
+                                // Let the loop try to find a new writer.
+                                continue;
+                            }
                         }
-                        warn!(writer_id = current.writer_id, "ME writer channel closed");
-                        self.remove_writer_and_close_clients(current.writer_id).await;
-                        continue;
                     }
                     Err(TrySendError::Closed(_)) => {
                         warn!(writer_id = current.writer_id, "ME writer channel closed");
@@ -321,12 +345,21 @@ impl MePool {
                 ws.clone()
             };
 
+            // Prefer Active writers, then Warm, then Draining as last resort.
+            // This prevents new connections from landing on draining writers when
+            // healthy alternatives exist — fixing slow drain completion.
             let mut candidate_indices = self
                 .candidate_indices_for_dc(&writers_snapshot, routed_dc, false)
                 .await;
             if candidate_indices.is_empty() {
                 candidate_indices = self
                     .candidate_indices_for_dc(&writers_snapshot, routed_dc, true)
+                    .await;
+            }
+            if candidate_indices.is_empty() {
+                // Last resort: include draining writers that still accept bindings.
+                candidate_indices = self
+                    .candidate_indices_for_dc_inner(&writers_snapshot, routed_dc, true, true)
                     .await;
             }
             if candidate_indices.is_empty() {
@@ -551,8 +584,8 @@ impl MePool {
             self.stats.increment_me_writer_pick_blocking_fallback_total();
             let effective_our_addr = SocketAddr::new(w.source_ip, our_addr.port());
             let (payload, meta) = build_routed_payload(effective_our_addr);
-            match w.tx.send(WriterCommand::Data(payload.clone())).await {
-                Ok(()) => {
+            match tokio::time::timeout(BLOCKING_SEND_TIMEOUT, w.tx.send(WriterCommand::Data(payload.clone()))).await {
+                Ok(Ok(())) => {
                     self.stats
                         .increment_me_writer_pick_success_fallback_total(pick_mode);
                     if !self.registry.bind_writer(conn_id, w.id, meta).await {
@@ -568,10 +601,14 @@ impl MePool {
                     }
                     return Ok(());
                 }
-                Err(_) => {
+                Ok(Err(_)) => {
                     self.stats.increment_me_writer_pick_closed_total(pick_mode);
                     warn!(writer_id = w.id, "ME writer channel closed (blocking)");
                     self.remove_writer_and_close_clients(w.id).await;
+                }
+                Err(_timeout) => {
+                    self.stats.increment_me_writer_pick_full_total(pick_mode);
+                    warn!(writer_id = w.id, "ME writer blocking fallback send timeout");
                 }
             }
         }
@@ -628,9 +665,10 @@ impl MePool {
             return false;
         }
         // Check without cloning — scan in-place under read lock.
+        // Include draining writers too — they serve as fallback.
         for w in ws.iter() {
             if w.writer_dc == routed_dc && preferred.iter().any(|e| *e == w.addr) {
-                if self.writer_eligible_for_selection(w, true) {
+                if self.writer_eligible_for_selection_inner(w, true, true) {
                     return true;
                 }
             }
@@ -760,6 +798,16 @@ impl MePool {
         routed_dc: i32,
         include_warm: bool,
     ) -> Vec<usize> {
+        self.candidate_indices_for_dc_inner(writers, routed_dc, include_warm, false).await
+    }
+
+    async fn candidate_indices_for_dc_inner(
+        &self,
+        writers: &[super::pool::MeWriter],
+        routed_dc: i32,
+        include_warm: bool,
+        include_draining: bool,
+    ) -> Vec<usize> {
         let preferred = self.preferred_endpoints_for_dc(routed_dc).await;
         if preferred.is_empty() {
             return Vec::new();
@@ -767,7 +815,7 @@ impl MePool {
 
         let mut out = Vec::new();
         for (idx, w) in writers.iter().enumerate() {
-            if !self.writer_eligible_for_selection(w, include_warm) {
+            if !self.writer_eligible_for_selection_inner(w, include_warm, include_draining) {
                 continue;
             }
             if w.writer_dc == routed_dc && preferred.iter().any(|endpoint| *endpoint == w.addr) {
@@ -782,6 +830,15 @@ impl MePool {
         writer: &super::pool::MeWriter,
         include_warm: bool,
     ) -> bool {
+        self.writer_eligible_for_selection_inner(writer, include_warm, false)
+    }
+
+    fn writer_eligible_for_selection_inner(
+        &self,
+        writer: &super::pool::MeWriter,
+        include_warm: bool,
+        include_draining: bool,
+    ) -> bool {
         if !self.writer_accepts_new_binding(writer) {
             return false;
         }
@@ -789,7 +846,7 @@ impl MePool {
         match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
             WriterContour::Active => true,
             WriterContour::Warm => include_warm,
-            WriterContour::Draining => true,
+            WriterContour::Draining => include_draining,
         }
     }
 
