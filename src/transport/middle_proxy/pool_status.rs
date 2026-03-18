@@ -40,6 +40,7 @@ pub(crate) struct MeApiDcStatusSnapshot {
     pub floor_max: usize,
     pub floor_capped: bool,
     pub alive_writers: usize,
+    pub coverage_ratio: f64,
     pub coverage_pct: f64,
     pub fresh_alive_writers: usize,
     pub fresh_coverage_pct: f64,
@@ -62,6 +63,7 @@ pub(crate) struct MeApiStatusSnapshot {
     pub available_pct: f64,
     pub required_writers: usize,
     pub alive_writers: usize,
+    pub coverage_ratio: f64,
     pub coverage_pct: f64,
     pub fresh_alive_writers: usize,
     pub fresh_coverage_pct: f64,
@@ -342,6 +344,8 @@ impl MePool {
         let mut available_endpoints = 0usize;
         let mut alive_writers = 0usize;
         let mut fresh_alive_writers = 0usize;
+        let mut coverage_ratio_dcs_total = 0usize;
+        let mut coverage_ratio_dcs_covered = 0usize;
         let floor_mode = self.floor_mode();
         let adaptive_cpu_cores = (self
             .me_adaptive_floor_cpu_cores_effective
@@ -393,6 +397,12 @@ impl MePool {
             available_endpoints += dc_available_endpoints;
             alive_writers += dc_alive_writers;
             fresh_alive_writers += dc_fresh_alive_writers;
+            if endpoint_count > 0 {
+                coverage_ratio_dcs_total += 1;
+                if dc_alive_writers > 0 {
+                    coverage_ratio_dcs_covered += 1;
+                }
+            }
 
             dcs.push(MeApiDcStatusSnapshot {
                 dc,
@@ -415,6 +425,11 @@ impl MePool {
                 floor_max,
                 floor_capped,
                 alive_writers: dc_alive_writers,
+                coverage_ratio: if endpoint_count > 0 && dc_alive_writers > 0 {
+                    100.0
+                } else {
+                    0.0
+                },
                 coverage_pct: ratio_pct(dc_alive_writers, dc_required_writers),
                 fresh_alive_writers: dc_fresh_alive_writers,
                 fresh_coverage_pct: ratio_pct(dc_fresh_alive_writers, dc_required_writers),
@@ -431,6 +446,7 @@ impl MePool {
             available_pct: ratio_pct(available_endpoints, configured_endpoints),
             required_writers,
             alive_writers,
+            coverage_ratio: ratio_pct(coverage_ratio_dcs_covered, coverage_ratio_dcs_total),
             coverage_pct: ratio_pct(alive_writers, required_writers),
             fresh_alive_writers,
             fresh_coverage_pct: ratio_pct(fresh_alive_writers, required_writers),

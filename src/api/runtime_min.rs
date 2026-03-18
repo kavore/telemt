@@ -113,6 +113,7 @@ pub(super) struct RuntimeMeQualityDcRttData {
     pub(super) rtt_ema_ms: Option<f64>,
     pub(super) alive_writers: usize,
     pub(super) required_writers: usize,
+    pub(super) coverage_ratio: f64,
     pub(super) coverage_pct: f64,
 }
 
@@ -388,6 +389,7 @@ pub(super) async fn build_runtime_me_quality_data(shared: &ApiShared) -> Runtime
                     rtt_ema_ms: dc.rtt_ms,
                     alive_writers: dc.alive_writers,
                     required_writers: dc.required_writers,
+                    coverage_ratio: dc.coverage_ratio,
                     coverage_pct: dc.coverage_pct,
                 })
                 .collect(),
