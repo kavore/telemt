@@ -113,6 +113,10 @@ impl SessionAdaptiveController {
         }
     }
 
+    pub fn current_tier(&self) -> AdaptiveTier {
+        self.tier
+    }
+
     pub fn max_tier_seen(&self) -> AdaptiveTier {
         self.max_tier_seen
     }

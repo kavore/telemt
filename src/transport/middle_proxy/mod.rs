@@ -47,6 +47,7 @@ pub use rotation::{MeReinitTrigger, me_reinit_scheduler, me_rotation_task};
 pub(crate) use selftest::{
     bnd_snapshot, timeskew_snapshot, upstream_bnd_snapshots,
 };
+pub use send::CachedMeWriter;
 pub use wire::proto_flags_for_tag;
 
 #[derive(Debug)]

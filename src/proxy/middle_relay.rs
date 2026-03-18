@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::proxy::adaptive_buffers::{self, AdaptiveTier};
 use crate::proxy::session_eviction::SessionLease;
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
-use crate::transport::middle_proxy::{MePool, MeResponse, proto_flags_for_tag};
+use crate::transport::middle_proxy::{CachedMeWriter, MePool, MeResponse, proto_flags_for_tag};
 
 enum C2MeCommand {
     Data { payload: Bytes, flags: u32 },
@@ -38,6 +38,7 @@ const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
 const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
+const ME_ADAPTIVE_TICK: Duration = Duration::from_millis(250);
 static DESYNC_DEDUP: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
 
 struct RelayForensicsState {
@@ -360,10 +361,11 @@ where
     let effective_tag = effective_tag;
     let c2me_sender = tokio::spawn(async move {
         let mut sent_since_yield = 0usize;
+        let mut cached_writer: Option<CachedMeWriter> = None;
         while let Some(cmd) = c2me_rx.recv().await {
             match cmd {
                 C2MeCommand::Data { payload, flags } => {
-                    me_pool_c2me.send_proxy_req(
+                    me_pool_c2me.send_proxy_req_cached(
                         conn_id,
                         success.dc_idx,
                         peer,
@@ -371,6 +373,7 @@ where
                         payload.as_ref(),
                         flags,
                         effective_tag.as_deref(),
+                        &mut cached_writer,
                     ).await?;
                     sent_since_yield = sent_since_yield.saturating_add(1);
                     if should_yield_c2me_sender(sent_since_yield, !c2me_rx.is_empty()) {
@@ -393,12 +396,43 @@ where
     let rng_clone = rng.clone();
     let user_clone = user.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
-    let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config, seed_tier);
+    let config_clone = config.clone();
+    let shared_max_tier = Arc::new(AtomicU8::new(seed_tier.as_u8()));
+    let shared_max_tier_writer = shared_max_tier.clone();
     let me_writer = tokio::spawn(async move {
         let mut writer = crypto_writer;
         let mut frame_buf = Vec::with_capacity(16 * 1024);
+        let mut d2c_flush_policy = MeD2cFlushPolicy::from_config(&config_clone, seed_tier);
+
+        // Adaptive tier runtime tracking — mirrors direct_relay watchdog.
+        let mut adaptive = adaptive_buffers::SessionAdaptiveController::new(seed_tier);
+        let mut adaptive_tick = tokio::time::interval(ME_ADAPTIVE_TICK);
+        adaptive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prev_me2c_sample: u64 = 0;
+
         loop {
             tokio::select! {
+                biased;
+                _ = adaptive_tick.tick() => {
+                    let current_me2c = bytes_me2c_clone.load(Ordering::Relaxed);
+                    let delta_bytes = current_me2c.saturating_sub(prev_me2c_sample);
+                    prev_me2c_sample = current_me2c;
+
+                    // ME relay only has s2c throughput signal from the ME side.
+                    let sample = adaptive_buffers::RelaySignalSample {
+                        c2s_bytes: 0,
+                        s2c_requested_bytes: delta_bytes,
+                        s2c_written_bytes: delta_bytes,
+                        s2c_write_ops: 0,
+                        s2c_partial_writes: 0,
+                        s2c_consecutive_pending_writes: 0,
+                    };
+                    if let Some(_transition) = adaptive.observe(sample, ME_ADAPTIVE_TICK.as_secs_f64()) {
+                        d2c_flush_policy = MeD2cFlushPolicy::from_config(&config_clone, adaptive.current_tier());
+                        shared_max_tier_writer.store(adaptive.max_tier_seen().as_u8(), Ordering::Relaxed);
+                        adaptive_buffers::record_user_tier(&user_clone, adaptive.max_tier_seen());
+                    }
+                }
                 msg = me_rx_task.recv() => {
                     let Some(first) = msg else {
                         debug!(conn_id, "ME channel closed");
@@ -552,6 +586,7 @@ where
     let mut client_closed = false;
     let mut frame_counter: u64 = 0;
     let mut route_watch_open = true;
+    let mut read_buf = Vec::with_capacity(16 * 1024);
     loop {
         if session_lease.is_stale() {
             stats.increment_reconnect_stale_close_total();
@@ -591,6 +626,7 @@ where
                 &forensics,
                 &mut frame_counter,
                 &stats,
+                &mut read_buf,
             ) => {
                 match payload_result {
                     Ok(Some((payload, quickack))) => {
@@ -667,7 +703,13 @@ where
         frames_ok = frame_counter,
         "ME relay cleanup"
     );
-    adaptive_buffers::record_user_tier(&user, seed_tier);
+    let final_tier = match shared_max_tier.load(Ordering::Relaxed) {
+        1 => AdaptiveTier::Tier1,
+        2 => AdaptiveTier::Tier2,
+        3 => AdaptiveTier::Tier3,
+        _ => seed_tier,
+    };
+    adaptive_buffers::record_user_tier(&user, final_tier);
     me_pool.registry().unregister(conn_id).await;
     stats.decrement_current_connections_me();
     stats.decrement_user_curr_connects(&user);
@@ -681,6 +723,7 @@ async fn read_client_payload<R>(
     forensics: &RelayForensicsState,
     frame_counter: &mut u64,
     stats: &Stats,
+    read_buf: &mut Vec<u8>,
 ) -> Result<Option<(Bytes, bool)>>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -769,18 +812,26 @@ where
             len
         };
 
-        let mut payload = vec![0u8; len];
+        // Reuse read buffer to avoid per-frame allocation.
+        read_buf.clear();
+        if read_buf.capacity() < len {
+            read_buf.reserve(len - read_buf.capacity());
+        }
+        read_buf.resize(len, 0);
         client_reader
-            .read_exact(&mut payload)
+            .read_exact(&mut read_buf[..len])
             .await
             .map_err(ProxyError::Io)?;
 
-        // Secure Intermediate: strip validated trailing padding bytes.
-        if proto_tag == ProtoTag::Secure {
-            payload.truncate(secure_payload_len);
-        }
+        let payload_len = if proto_tag == ProtoTag::Secure {
+            secure_payload_len
+        } else {
+            len
+        };
+        // Copy to Bytes for ownership transfer through channel.
+        let payload = Bytes::copy_from_slice(&read_buf[..payload_len]);
         *frame_counter += 1;
-        return Ok(Some((Bytes::from(payload), quickack)));
+        return Ok(Some((payload, quickack)));
     }
 }
 

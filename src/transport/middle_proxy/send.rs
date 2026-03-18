@@ -29,7 +29,80 @@ const PICK_PENALTY_DRAINING: u64 = 600;
 const PICK_PENALTY_STALE: u64 = 300;
 const PICK_PENALTY_DEGRADED: u64 = 250;
 
+/// Cached writer binding for fast-path sends. Avoids registry lookups per frame.
+pub struct CachedMeWriter {
+    pub writer_id: u64,
+    pub tx: tokio::sync::mpsc::Sender<WriterCommand>,
+    pub source_ip: std::net::IpAddr,
+}
+
 impl MePool {
+    /// Fast-path send that tries the cached writer first, falling back to full send_proxy_req.
+    /// The cache is invalidated when the writer channel is closed.
+    pub async fn send_proxy_req_cached(
+        self: &Arc<Self>,
+        conn_id: u64,
+        target_dc: i16,
+        client_addr: SocketAddr,
+        our_addr: SocketAddr,
+        data: &[u8],
+        proto_flags: u32,
+        tag_override: Option<&[u8]>,
+        cached: &mut Option<CachedMeWriter>,
+    ) -> Result<()> {
+        if let Some(ref cache) = *cached {
+            let tag = tag_override.or(self.proxy_tag.as_deref());
+            let effective_our_addr = SocketAddr::new(cache.source_ip, our_addr.port());
+            let payload = build_proxy_req_payload(
+                conn_id,
+                client_addr,
+                effective_our_addr,
+                data,
+                tag,
+                proto_flags,
+            );
+            match cache.tx.try_send(WriterCommand::Data(payload)) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(cmd)) => {
+                    if cache.tx.send(cmd).await.is_ok() {
+                        return Ok(());
+                    }
+                    // Writer channel closed — invalidate cache and fall through.
+                    let dead_id = cache.writer_id;
+                    *cached = None;
+                    self.remove_writer_and_close_clients(dead_id).await;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    let dead_id = cache.writer_id;
+                    *cached = None;
+                    self.remove_writer_and_close_clients(dead_id).await;
+                }
+            }
+        }
+
+        // Slow path: full send with writer selection.
+        self.send_proxy_req(conn_id, target_dc, client_addr, our_addr, data, proto_flags, tag_override).await?;
+
+        // Populate cache from the now-bound writer for future fast-path sends.
+        if let Some(cw) = self.registry.get_writer(conn_id).await {
+            let source_ip = {
+                let ws = self.writers.read().await;
+                ws.iter()
+                    .find(|w| w.id == cw.writer_id)
+                    .map(|w| w.source_ip)
+            };
+            if let Some(ip) = source_ip {
+                *cached = Some(CachedMeWriter {
+                    writer_id: cw.writer_id,
+                    tx: cw.tx,
+                    source_ip: ip,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
     pub async fn send_proxy_req(
         self: &Arc<Self>,
