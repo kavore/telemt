@@ -25,7 +25,9 @@ const IDLE_WRITER_PENALTY_MID_SECS: u64 = 45;
 const IDLE_WRITER_PENALTY_HIGH_SECS: u64 = 55;
 /// Timeout for blocking send when writer channel is full.
 /// Prevents client main loop from freezing if a writer task is stuck or slow.
-const BLOCKING_SEND_TIMEOUT: Duration = Duration::from_millis(200);
+/// 2s is conservative — enough for normal backpressure to clear, short enough
+/// to detect truly stuck writers.
+const BLOCKING_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const HYBRID_GLOBAL_BURST_PERIOD_ROUNDS: u32 = 4;
 const PICK_PENALTY_WARM: u64 = 200;
 const PICK_PENALTY_DRAINING: u64 = 600;
