@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, trace, warn};
 
 use crate::config::ProxyConfig;
@@ -26,16 +26,8 @@ use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::middle_proxy::{CachedMeWriter, MePool, MeResponse, proto_flags_for_tag};
 
-enum C2MeCommand {
-    Data { payload: Bytes, flags: u32 },
-    Close,
-}
-
 const DESYNC_DEDUP_WINDOW: Duration = Duration::from_secs(60);
 const DESYNC_ERROR_CLASS: &str = "frame_too_large_crypto_desync";
-const C2ME_CHANNEL_CAPACITY_FALLBACK: usize = 128;
-const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
-const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
 const ME_ADAPTIVE_TICK: Duration = Duration::from_millis(250);
@@ -216,27 +208,6 @@ fn report_desync_frame_too_large(
     ))
 }
 
-fn should_yield_c2me_sender(sent_since_yield: usize, has_backlog: bool) -> bool {
-    has_backlog && sent_since_yield >= C2ME_SENDER_FAIRNESS_BUDGET
-}
-
-async fn enqueue_c2me_command(
-    tx: &mpsc::Sender<C2MeCommand>,
-    cmd: C2MeCommand,
-) -> std::result::Result<(), mpsc::error::SendError<C2MeCommand>> {
-    match tx.try_send(cmd) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Closed(cmd)) => Err(mpsc::error::SendError(cmd)),
-        Err(mpsc::error::TrySendError::Full(cmd)) => {
-            // Cooperative yield reduces burst catch-up when the per-conn queue is near saturation.
-            if tx.capacity() <= C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS {
-                tokio::task::yield_now().await;
-            }
-            tx.send(cmd).await
-        }
-    }
-}
-
 pub(crate) async fn handle_via_middle_proxy<R, W>(
     mut crypto_reader: CryptoReader<R>,
     crypto_writer: CryptoWriter<W>,
@@ -352,43 +323,11 @@ where
 
     let frame_limit = config.general.max_client_frame;
 
-    let c2me_channel_capacity = config
-        .general
-        .me_c2me_channel_capacity
-        .max(C2ME_CHANNEL_CAPACITY_FALLBACK);
-    let (c2me_tx, mut c2me_rx) = mpsc::channel::<C2MeCommand>(c2me_channel_capacity);
-    let me_pool_c2me = me_pool.clone();
     let effective_tag = effective_tag;
-    let c2me_sender = tokio::spawn(async move {
-        let mut sent_since_yield = 0usize;
-        let mut cached_writer: Option<CachedMeWriter> = None;
-        while let Some(cmd) = c2me_rx.recv().await {
-            match cmd {
-                C2MeCommand::Data { payload, flags } => {
-                    me_pool_c2me.send_proxy_req_cached(
-                        conn_id,
-                        success.dc_idx,
-                        peer,
-                        translated_local_addr,
-                        payload.as_ref(),
-                        flags,
-                        effective_tag.as_deref(),
-                        &mut cached_writer,
-                    ).await?;
-                    sent_since_yield = sent_since_yield.saturating_add(1);
-                    if should_yield_c2me_sender(sent_since_yield, !c2me_rx.is_empty()) {
-                        sent_since_yield = 0;
-                        tokio::task::yield_now().await;
-                    }
-                }
-                C2MeCommand::Close => {
-                    let _ = me_pool_c2me.send_close(conn_id).await;
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    });
+    // C2ME send state — inline in main loop instead of separate task.
+    // Eliminates 1 channel + 1 spawned task per connection.
+    let mut cached_writer: Option<CachedMeWriter> = None;
+    let target_dc = success.dc_idx;
 
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let mut me_rx_task = me_rx;
@@ -590,7 +529,7 @@ where
     loop {
         if session_lease.is_stale() {
             stats.increment_reconnect_stale_close_total();
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
+            let _ = me_pool.send_close(conn_id).await;
             main_result = Err(ProxyError::Proxy("Session evicted by reconnect".to_string()));
             break;
         }
@@ -608,7 +547,7 @@ where
                 "Cutover affected middle session, closing client connection"
             );
             tokio::time::sleep(delay).await;
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
+            let _ = me_pool.send_close(conn_id).await;
             main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
             break;
         }
@@ -642,19 +581,25 @@ where
                         if payload.len() >= 8 && payload[..8].iter().all(|b| *b == 0) {
                             flags |= RPC_FLAG_NOT_ENCRYPTED;
                         }
-                        // Keep client read loop lightweight: route heavy ME send path via a dedicated task.
-                        if enqueue_c2me_command(&c2me_tx, C2MeCommand::Data { payload, flags })
-                            .await
-                            .is_err()
-                        {
-                            main_result = Err(ProxyError::Proxy("ME sender channel closed".into()));
+                        // Send directly to ME pool — no intermediate channel/task.
+                        if let Err(e) = me_pool.send_proxy_req_cached(
+                            conn_id,
+                            target_dc,
+                            peer,
+                            translated_local_addr,
+                            payload.as_ref(),
+                            flags,
+                            effective_tag.as_deref(),
+                            &mut cached_writer,
+                        ).await {
+                            main_result = Err(e);
                             break;
                         }
                     }
                     Ok(None) => {
                         debug!(conn_id, "Client EOF");
                         client_closed = true;
-                        let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
+                        let _ = me_pool.send_close(conn_id).await;
                         break;
                     }
                     Err(e) => {
@@ -665,11 +610,6 @@ where
             }
         }
     }
-
-    drop(c2me_tx);
-    let c2me_result = c2me_sender
-        .await
-        .unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME sender join error: {e}"))));
 
     let _ = stop_tx.send(());
     let mut writer_result = me_writer
@@ -686,11 +626,10 @@ where
         writer_result = Ok(());
     }
 
-    let result = match (main_result, c2me_result, writer_result) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Err(e), _, _) => Err(e),
-        (_, Err(e), _) => Err(e),
-        (_, _, Err(e)) => Err(e),
+    let result = match (main_result, writer_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), _) => Err(e),
+        (_, Err(e)) => Err(e),
     };
 
     debug!(
@@ -1022,83 +961,3 @@ where
         .map_err(ProxyError::Io)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::{Duration as TokioDuration, timeout};
-
-    #[test]
-    fn should_yield_sender_only_on_budget_with_backlog() {
-        assert!(!should_yield_c2me_sender(0, true));
-        assert!(!should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET - 1, true));
-        assert!(!should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET, false));
-        assert!(should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET, true));
-    }
-
-    #[tokio::test]
-    async fn enqueue_c2me_command_uses_try_send_fast_path() {
-        let (tx, mut rx) = mpsc::channel::<C2MeCommand>(2);
-        enqueue_c2me_command(
-            &tx,
-            C2MeCommand::Data {
-                payload: Bytes::from_static(&[1, 2, 3]),
-                flags: 0,
-            },
-        )
-        .await
-        .unwrap();
-
-        let recv = timeout(TokioDuration::from_millis(50), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match recv {
-            C2MeCommand::Data { payload, flags } => {
-                assert_eq!(payload.as_ref(), &[1, 2, 3]);
-                assert_eq!(flags, 0);
-            }
-            C2MeCommand::Close => panic!("unexpected close command"),
-        }
-    }
-
-    #[tokio::test]
-    async fn enqueue_c2me_command_falls_back_to_send_when_queue_is_full() {
-        let (tx, mut rx) = mpsc::channel::<C2MeCommand>(1);
-        tx.send(C2MeCommand::Data {
-            payload: Bytes::from_static(&[9]),
-            flags: 9,
-        })
-        .await
-        .unwrap();
-
-        let tx2 = tx.clone();
-        let producer = tokio::spawn(async move {
-            enqueue_c2me_command(
-                &tx2,
-                C2MeCommand::Data {
-                    payload: Bytes::from_static(&[7, 7]),
-                    flags: 7,
-                },
-            )
-            .await
-            .unwrap();
-        });
-
-        let _ = timeout(TokioDuration::from_millis(100), rx.recv())
-            .await
-            .unwrap();
-        producer.await.unwrap();
-
-        let recv = timeout(TokioDuration::from_millis(100), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match recv {
-            C2MeCommand::Data { payload, flags } => {
-                assert_eq!(payload.as_ref(), &[7, 7]);
-                assert_eq!(flags, 7);
-            }
-            C2MeCommand::Close => panic!("unexpected close command"),
-        }
-    }
-}
