@@ -483,10 +483,19 @@ async fn check_family(
         floor_plan.warm_writers_current,
     );
 
-    for (dc, endpoints) in dc_endpoints {
+    // Shuffle DC iteration order so reconnect budget is distributed fairly
+    // across DCs over multiple health cycles. HashMap iteration order is
+    // arbitrary but stable, which would starve later DCs when budget is tight.
+    let mut dc_list: Vec<_> = dc_endpoints.into_iter().collect();
+    dc_list.sort_unstable_by_key(|(dc, _)| *dc);
+    use rand::seq::SliceRandom;
+    dc_list.shuffle(&mut rand::rng());
+
+    for (dc, endpoints) in &dc_list {
         if endpoints.is_empty() {
             continue;
         }
+        let dc = *dc;
         let key = (dc, family);
         let required = floor_plan
             .by_dc
@@ -740,6 +749,18 @@ async fn check_family(
             *v = v.saturating_sub(1);
         }
     }
+
+    // Prune stale tracking state for DCs no longer in the proxy map.
+    let active_dc_keys: HashSet<(i32, IpFamily)> = dc_list
+        .iter()
+        .map(|(dc, _)| (*dc, family))
+        .collect();
+    adaptive_idle_since.retain(|k, _| active_dc_keys.contains(k));
+    adaptive_recover_until.retain(|k, _| active_dc_keys.contains(k));
+    floor_warn_next_allowed.retain(|k, _| active_dc_keys.contains(k));
+    backoff.retain(|k, _| active_dc_keys.contains(k));
+    next_attempt.retain(|k, _| active_dc_keys.contains(k));
+    inflight.retain(|k, _| active_dc_keys.contains(k));
 
     family_degraded
 }

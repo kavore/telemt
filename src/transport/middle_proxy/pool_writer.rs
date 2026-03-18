@@ -575,7 +575,7 @@ impl MePool {
                 }
                 w.contour
                     .store(WriterContour::Draining.as_u8(), Ordering::Relaxed);
-                w.draining.store(true, Ordering::Relaxed);
+                // Note: draining is already set to true by swap() above.
                 true
             } else {
                 false
