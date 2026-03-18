@@ -191,11 +191,13 @@ impl MePool {
     }
 
     async fn refill_writer_after_loss(self: &Arc<Self>, addr: SocketAddr, writer_dc: i32) -> bool {
-        let fast_retries = self.me_reconnect_fast_retry_count.max(1);
+        // Limit same-endpoint retries to 3 (was 16) with exponential backoff.
+        let same_endpoint_retries = self.me_reconnect_fast_retry_count.max(1).min(3);
         let same_endpoint_quarantined = self.is_endpoint_quarantined(addr).await;
+        let backoff_base_ms = self.me_reconnect_backoff_base.as_millis() as u64;
 
         if !same_endpoint_quarantined {
-            for attempt in 0..fast_retries {
+            for attempt in 0..same_endpoint_retries {
                 self.stats.increment_me_reconnect_attempt();
                 match self.connect_one_for_dc(addr, writer_dc, self.rng.as_ref()).await {
                     Ok(()) => {
@@ -215,6 +217,10 @@ impl MePool {
                             error = %e,
                             "ME immediate same-endpoint reconnect failed"
                         );
+                        // Exponential backoff: base * 2^attempt (capped at backoff_cap).
+                        let delay_ms = backoff_base_ms.saturating_mul(1u64 << attempt.min(4))
+                            .min(self.me_reconnect_backoff_cap.as_millis() as u64);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }
             }
@@ -225,13 +231,15 @@ impl MePool {
             );
         }
 
+        // Fallback to other DC endpoints with limited retries and backoff.
         let dc_endpoints = self.endpoints_for_dc(writer_dc).await;
         if dc_endpoints.is_empty() {
             self.stats.increment_me_refill_failed_total();
             return false;
         }
 
-        for attempt in 0..fast_retries {
+        let fallback_retries = self.me_reconnect_fast_retry_count.max(1).min(4);
+        for attempt in 0..fallback_retries {
             self.stats.increment_me_reconnect_attempt();
             if self
                 .connect_endpoints_round_robin(writer_dc, &dc_endpoints, self.rng.as_ref())
@@ -246,6 +254,10 @@ impl MePool {
                 );
                 return true;
             }
+            // Brief backoff before next round-robin attempt.
+            let delay_ms = backoff_base_ms.saturating_mul(1u64 << attempt.min(3))
+                .min(self.me_reconnect_backoff_cap.as_millis() as u64);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
         self.stats.increment_me_refill_failed_total();
@@ -257,6 +269,9 @@ impl MePool {
             dc: writer_dc,
             addr,
         };
+        // Dedup per-endpoint only — allow concurrent refills for different endpoints within same DC.
+        // Previously per-DC dedup blocked all concurrent refills, causing slow recovery when multiple
+        // writers for the same DC died simultaneously.
         let pre_inserted = if let Ok(mut guard) = self.refill_inflight.try_lock() {
             if !guard.insert(endpoint_key) {
                 self.stats.increment_me_refill_skipped_inflight_total();
@@ -268,16 +283,15 @@ impl MePool {
         };
 
         let pool = Arc::clone(self);
+        let dc_key = RefillDcKey {
+            dc: writer_dc,
+            family: if addr.is_ipv4() {
+                IpFamily::V4
+            } else {
+                IpFamily::V6
+            },
+        };
         tokio::spawn(async move {
-            let dc_key = RefillDcKey {
-                dc: writer_dc,
-                family: if addr.is_ipv4() {
-                    IpFamily::V4
-                } else {
-                    IpFamily::V6
-                },
-            };
-
             if !pre_inserted {
                 let mut guard = pool.refill_inflight.lock().await;
                 if !guard.insert(endpoint_key) {
@@ -286,15 +300,9 @@ impl MePool {
                 }
             }
 
+            // Track DC-level inflight for health monitor coordination (non-blocking).
             {
                 let mut dc_guard = pool.refill_inflight_dc.lock().await;
-                if dc_guard.contains(&dc_key) {
-                    pool.stats.increment_me_refill_skipped_inflight_total();
-                    drop(dc_guard);
-                    let mut guard = pool.refill_inflight.lock().await;
-                    guard.remove(&endpoint_key);
-                    return;
-                }
                 dc_guard.insert(dc_key);
             }
 

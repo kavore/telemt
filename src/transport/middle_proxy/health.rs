@@ -133,15 +133,25 @@ pub(super) async fn reap_draining_writers(
     let drain_threshold = pool
         .me_pool_drain_threshold
         .load(std::sync::atomic::Ordering::Relaxed);
-    let writers = pool.writers.read().await.clone();
+    // Collect only draining writers to avoid cloning the full Vec.
+    let draining_snapshot: Vec<_> = {
+        let ws = pool.writers.read().await;
+        ws.iter()
+            .filter(|w| w.draining.load(std::sync::atomic::Ordering::Relaxed))
+            .cloned()
+            .collect()
+    };
+    if draining_snapshot.is_empty() {
+        // Still clean up stale warn/evict state for writers that are no longer draining.
+        warn_next_allowed.clear();
+        soft_evict_next_allowed.clear();
+        return;
+    }
     let activity = pool.registry.writer_activity_snapshot().await;
     let mut draining_writers = Vec::new();
     let mut empty_writer_ids = Vec::<u64>::new();
     let mut force_close_writer_ids = Vec::<u64>::new();
-    for writer in writers {
-        if !writer.draining.load(std::sync::atomic::Ordering::Relaxed) {
-            continue;
-        }
+    for writer in draining_snapshot {
         if activity
             .bound_clients_by_writer
             .get(&writer.id)
