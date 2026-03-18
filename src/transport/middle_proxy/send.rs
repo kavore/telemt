@@ -17,7 +17,7 @@ use crate::protocol::constants::{RPC_CLOSE_CONN_U32, RPC_CLOSE_EXT_U32};
 use super::MePool;
 use super::codec::WriterCommand;
 use super::pool::WriterContour;
-use super::wire::build_proxy_req_payload;
+use super::wire::{build_proxy_req_payload, RpcHeaderTemplate};
 use rand::seq::SliceRandom;
 use super::registry::ConnMeta;
 
@@ -29,11 +29,16 @@ const PICK_PENALTY_DRAINING: u64 = 600;
 const PICK_PENALTY_STALE: u64 = 300;
 const PICK_PENALTY_DEGRADED: u64 = 250;
 
-/// Cached writer binding for fast-path sends. Avoids registry lookups per frame.
+/// Cached writer binding for fast-path sends. Avoids registry lookups and
+/// header reconstruction per frame.
 pub struct CachedMeWriter {
     pub writer_id: u64,
     pub tx: tokio::sync::mpsc::Sender<WriterCommand>,
     pub source_ip: std::net::IpAddr,
+    /// Pre-computed RPC header template (addresses, conn_id, ad_tag — all session-constant).
+    header: RpcHeaderTemplate,
+    /// Reusable buffer for payload assembly — avoids per-frame allocation.
+    payload_buf: Vec<u8>,
 }
 
 impl MePool {
@@ -50,24 +55,15 @@ impl MePool {
         tag_override: Option<&[u8]>,
         cached: &mut Option<CachedMeWriter>,
     ) -> Result<()> {
-        if let Some(ref cache) = *cached {
-            let tag = tag_override.or(self.proxy_tag.as_deref());
-            let effective_our_addr = SocketAddr::new(cache.source_ip, our_addr.port());
-            let payload = build_proxy_req_payload(
-                conn_id,
-                client_addr,
-                effective_our_addr,
-                data,
-                tag,
-                proto_flags,
-            );
+        if let Some(ref mut cache) = *cached {
+            // Fast path: pre-computed header template + reusable buffer. Only data + flags patch per frame.
+            let payload = cache.header.build(proto_flags, data, &mut cache.payload_buf);
             match cache.tx.try_send(WriterCommand::Data(payload)) {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(cmd)) => {
                     if cache.tx.send(cmd).await.is_ok() {
                         return Ok(());
                     }
-                    // Writer channel closed — invalidate cache and fall through.
                     let dead_id = cache.writer_id;
                     *cached = None;
                     self.remove_writer_and_close_clients(dead_id).await;
@@ -83,7 +79,7 @@ impl MePool {
         // Slow path: full send with writer selection.
         self.send_proxy_req(conn_id, target_dc, client_addr, our_addr, data, proto_flags, tag_override).await?;
 
-        // Populate cache from the now-bound writer for future fast-path sends.
+        // Populate cache with pre-computed header for future fast-path sends.
         if let Some(cw) = self.registry.get_writer(conn_id).await {
             let source_ip = {
                 let ws = self.writers.read().await;
@@ -92,10 +88,21 @@ impl MePool {
                     .map(|w| w.source_ip)
             };
             if let Some(ip) = source_ip {
+                let tag = tag_override.or(self.proxy_tag.as_deref());
+                let effective_our_addr = SocketAddr::new(ip, our_addr.port());
+                let header = RpcHeaderTemplate::new(
+                    conn_id,
+                    client_addr,
+                    effective_our_addr,
+                    tag,
+                    proto_flags,
+                );
                 *cached = Some(CachedMeWriter {
                     writer_id: cw.writer_id,
                     tx: cw.tx,
                     source_ip: ip,
+                    header,
+                    payload_buf: Vec::with_capacity(4096),
                 });
             }
         }

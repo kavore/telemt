@@ -89,6 +89,79 @@ pub(crate) fn build_proxy_req_payload(
     Bytes::from(b)
 }
 
+/// Pre-computed RPC header template for a session. proto_flags field at offset 4..8
+/// is patched per-frame since quickack/not_encrypted bits vary.
+/// Layout: [RPC_PROXY_REQ(4)] [proto_flags(4)] [conn_id(8)] [client_addr(20)] [our_addr(20)] [ad_tag_section(...)]
+pub(crate) struct RpcHeaderTemplate {
+    buf: Vec<u8>,
+}
+
+const PROTO_FLAGS_OFFSET: usize = 4;
+
+impl RpcHeaderTemplate {
+    pub fn new(
+        conn_id: u64,
+        client_addr: SocketAddr,
+        our_addr: SocketAddr,
+        proxy_tag: Option<&[u8]>,
+        base_proto_flags: u32,
+    ) -> Self {
+        let mut b = Vec::with_capacity(128);
+
+        b.extend_from_slice(&RPC_PROXY_REQ_U32.to_le_bytes());
+        b.extend_from_slice(&base_proto_flags.to_le_bytes()); // patched per-frame
+        b.extend_from_slice(&conn_id.to_le_bytes());
+
+        append_mapped_addr_and_port(&mut b, client_addr);
+        append_mapped_addr_and_port(&mut b, our_addr);
+
+        if base_proto_flags & RPC_FLAG_HAS_AD_TAG != 0 {
+            let extra_start = b.len();
+            b.extend_from_slice(&0u32.to_le_bytes());
+
+            if let Some(tag) = proxy_tag {
+                b.extend_from_slice(&TL_PROXY_TAG_U32.to_le_bytes());
+
+                if tag.len() < 254 {
+                    b.push(tag.len() as u8);
+                    b.extend_from_slice(tag);
+                    let pad = (4 - ((1 + tag.len()) % 4)) % 4;
+                    b.extend(std::iter::repeat_n(0u8, pad));
+                } else {
+                    b.push(0xfe);
+                    let len_bytes = (tag.len() as u32).to_le_bytes();
+                    b.extend_from_slice(&len_bytes[..3]);
+                    b.extend_from_slice(tag);
+                    let pad = (4 - (tag.len() % 4)) % 4;
+                    b.extend(std::iter::repeat_n(0u8, pad));
+                }
+            }
+
+            let extra_bytes = (b.len() - extra_start - 4) as u32;
+            b[extra_start..extra_start + 4].copy_from_slice(&extra_bytes.to_le_bytes());
+        }
+
+        Self { buf: b }
+    }
+
+    /// Assemble full RPC payload: copy header template, patch per-frame proto_flags, append data.
+    /// Uses `reuse_buf` to avoid per-frame allocation.
+    #[inline]
+    pub fn build(&self, proto_flags: u32, data: &[u8], reuse_buf: &mut Vec<u8>) -> Bytes {
+        reuse_buf.clear();
+        let total = self.buf.len() + data.len();
+        if reuse_buf.capacity() < total {
+            reuse_buf.reserve(total - reuse_buf.capacity());
+        }
+        reuse_buf.extend_from_slice(&self.buf);
+        // Patch per-frame flags (quickack, not_encrypted bits may differ).
+        reuse_buf[PROTO_FLAGS_OFFSET..PROTO_FLAGS_OFFSET + 4]
+            .copy_from_slice(&proto_flags.to_le_bytes());
+        reuse_buf.extend_from_slice(data);
+        Bytes::copy_from_slice(reuse_buf)
+    }
+}
+
 pub fn proto_flags_for_tag(tag: crate::protocol::constants::ProtoTag, has_proxy_tag: bool) -> u32 {
     use crate::protocol::constants::ProtoTag;
 
