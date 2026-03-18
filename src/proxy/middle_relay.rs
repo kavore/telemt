@@ -762,13 +762,8 @@ where
         };
 
         // Reuse read buffer to avoid per-frame allocation.
-        // SAFETY: read_exact will fully overwrite [0..len] before we read from it.
-        // Using set_len avoids zeroing memory that read_exact immediately overwrites.
         read_buf.clear();
-        if read_buf.capacity() < len {
-            read_buf.reserve(len - read_buf.capacity());
-        }
-        unsafe { read_buf.set_len(len); }
+        read_buf.resize(len, 0);
         client_reader
             .read_exact(&mut read_buf[..len])
             .await
