@@ -325,9 +325,19 @@ where
 
     let effective_tag = effective_tag;
     // C2ME send state — inline in main loop instead of separate task.
-    // Eliminates 1 channel + 1 spawned task per connection.
     let mut cached_writer: Option<CachedMeWriter> = None;
     let target_dc = success.dc_idx;
+
+    // Pre-bind writer BEFORE first client frame — eliminates slow path on first send.
+    me_pool.pre_bind_writer(
+        conn_id,
+        target_dc,
+        peer,
+        translated_local_addr,
+        proto_flags,
+        effective_tag.as_deref(),
+        &mut cached_writer,
+    ).await;
 
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let mut me_rx_task = me_rx;

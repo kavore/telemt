@@ -110,6 +110,65 @@ impl MePool {
         Ok(())
     }
 
+    /// Pre-bind a writer for the target DC before the first client frame arrives.
+    /// Populates the cached writer so the first send_proxy_req_cached hits the fast path.
+    /// Best-effort: returns quietly if no writer is available (first frame will do slow path).
+    pub async fn pre_bind_writer(
+        self: &Arc<Self>,
+        conn_id: u64,
+        target_dc: i16,
+        client_addr: SocketAddr,
+        our_addr: SocketAddr,
+        proto_flags: u32,
+        tag_override: Option<&[u8]>,
+        cached: &mut Option<CachedMeWriter>,
+    ) {
+        let (routed_dc, _) = self.resolve_target_dc_for_routing(target_dc as i32).await;
+        let writers_snapshot = {
+            let ws = self.writers.read().await;
+            if ws.is_empty() {
+                return;
+            }
+            ws.clone()
+        };
+        let mut candidate_indices = self
+            .candidate_indices_for_dc(&writers_snapshot, routed_dc, false)
+            .await;
+        if candidate_indices.is_empty() {
+            candidate_indices = self
+                .candidate_indices_for_dc(&writers_snapshot, routed_dc, true)
+                .await;
+        }
+        if candidate_indices.is_empty() {
+            return;
+        }
+        let start = self.rr.fetch_add(1, Ordering::Relaxed) as usize % candidate_indices.len();
+        let idx = candidate_indices[start % candidate_indices.len()];
+        let w = &writers_snapshot[idx];
+        if !self.writer_accepts_new_binding(w) {
+            return;
+        }
+        let effective_our_addr = SocketAddr::new(w.source_ip, our_addr.port());
+        let meta = ConnMeta {
+            target_dc,
+            client_addr,
+            our_addr: effective_our_addr,
+            proto_flags,
+        };
+        if !self.registry.bind_writer(conn_id, w.id, meta).await {
+            return;
+        }
+        let tag = tag_override.or(self.proxy_tag.as_deref());
+        let header = RpcHeaderTemplate::new(conn_id, client_addr, effective_our_addr, tag, proto_flags);
+        *cached = Some(CachedMeWriter {
+            writer_id: w.id,
+            tx: w.tx.clone(),
+            source_ip: w.source_ip,
+            header,
+            payload_buf: Vec::with_capacity(4096),
+        });
+    }
+
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
     pub async fn send_proxy_req(
         self: &Arc<Self>,
