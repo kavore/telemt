@@ -115,12 +115,6 @@ impl MePool {
         tag_override: Option<&[u8]>,
     ) -> Result<()> {
         let tag = tag_override.or(self.proxy_tag.as_deref());
-        let fallback_meta = ConnMeta {
-            target_dc,
-            client_addr,
-            our_addr,
-            proto_flags,
-        };
         let build_routed_payload = |effective_our_addr: SocketAddr| {
             (
                 build_proxy_req_payload(
@@ -153,13 +147,9 @@ impl MePool {
         let mut hybrid_wait_current = hybrid_wait_step;
 
         loop {
-            let current_meta = self
-                .registry
-                .get_meta(conn_id)
-                .await
-                .unwrap_or_else(|| fallback_meta.clone());
-            let (current_payload, _) = build_routed_payload(current_meta.our_addr);
+            // Fast check: if already bound, send directly without meta lookup.
             if let Some(current) = self.registry.get_writer(conn_id).await {
+                let (current_payload, _) = build_routed_payload(our_addr);
                 match current.tx.try_send(WriterCommand::Data(current_payload.clone())) {
                     Ok(()) => return Ok(()),
                     Err(TrySendError::Full(cmd)) => {
@@ -563,22 +553,23 @@ impl MePool {
     }
 
     async fn has_candidate_for_target_dc(&self, routed_dc: i32) -> bool {
-        let writers_snapshot = {
-            let ws = self.writers.read().await;
-            if ws.is_empty() {
-                return false;
-            }
-            ws.clone()
-        };
-        let mut candidate_indices = self
-            .candidate_indices_for_dc(&writers_snapshot, routed_dc, false)
-            .await;
-        if candidate_indices.is_empty() {
-            candidate_indices = self
-                .candidate_indices_for_dc(&writers_snapshot, routed_dc, true)
-                .await;
+        let preferred = self.preferred_endpoints_for_dc(routed_dc).await;
+        if preferred.is_empty() {
+            return false;
         }
-        !candidate_indices.is_empty()
+        let ws = self.writers.read().await;
+        if ws.is_empty() {
+            return false;
+        }
+        // Check without cloning — scan in-place under read lock.
+        for w in ws.iter() {
+            if w.writer_dc == routed_dc && preferred.iter().any(|e| *e == w.addr) {
+                if self.writer_eligible_for_selection(w, true) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     async fn trigger_async_recovery_for_target_dc(self: &Arc<Self>, routed_dc: i32) -> bool {
